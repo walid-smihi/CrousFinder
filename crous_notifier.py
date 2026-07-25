@@ -5,6 +5,7 @@ import logging
 import os
 import re
 import sys
+import time
 from pathlib import Path
 from urllib.parse import urlencode, urlparse, parse_qsl, urlunparse
 
@@ -23,6 +24,8 @@ DEFAULT_SEARCH_URLS = [
     "https://trouverunlogement.lescrous.fr/tools/42/search",  # rentree 2025-2026
     "https://trouverunlogement.lescrous.fr/tools/47/search",  # rentree 2026-2027
 ]
+
+TELEGRAM_SEND_DELAY = 1.1  # secondes entre deux envois, pour rester sous les limites de debit Telegram
 
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -123,7 +126,7 @@ def fetch_listings_page(page_url: str, search_url: str) -> list[dict]:
     return listings
 
 
-def send_telegram_message(token: str, chat_id: str | int, text: str) -> bool:
+def send_telegram_message(token: str, chat_id: str | int, text: str, _retried: bool = False) -> bool:
     """Returns True on success. Returns False (without raising) if Telegram rejects the chat_id
     (e.g. user blocked the bot or never started a private chat with it)."""
     url = f"https://api.telegram.org/bot{token}/sendMessage"
@@ -138,11 +141,18 @@ def send_telegram_message(token: str, chat_id: str | int, text: str) -> bool:
         timeout=30,
     )
     if resp.ok:
+        time.sleep(TELEGRAM_SEND_DELAY)
         return True
 
     if resp.status_code == 403:
         log.warning("Bot bloque ou chat inaccessible pour %s: %s", chat_id, resp.text)
         return False
+
+    if resp.status_code == 429 and not _retried:
+        retry_after = resp.json().get("parameters", {}).get("retry_after", 5)
+        log.warning("Limite Telegram atteinte, nouvelle tentative dans %ss", retry_after)
+        time.sleep(retry_after + 1)
+        return send_telegram_message(token, chat_id, text, _retried=True)
 
     log.error("Echec envoi Telegram vers %s: %s", chat_id, resp.text)
     resp.raise_for_status()
