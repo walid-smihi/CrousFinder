@@ -3,6 +3,7 @@
 import json
 import logging
 import os
+import re
 import sys
 from pathlib import Path
 
@@ -12,7 +13,10 @@ from bs4 import BeautifulSoup
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
 log = logging.getLogger("crous_notifier")
 
-STATE_FILE = Path(__file__).parent / "seen_ids.json"
+BASE_DIR = Path(__file__).parent
+SEEN_IDS_FILE = BASE_DIR / "seen_ids.json"
+SUBSCRIBERS_FILE = BASE_DIR / "subscribers.json"
+OFFSET_FILE = BASE_DIR / "update_offset.json"
 
 DEFAULT_SEARCH_URLS = [
     "https://trouverunlogement.lescrous.fr/tools/42/search",  # rentree 2025-2026
@@ -24,6 +28,9 @@ USER_AGENT = (
     "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
 )
 
+# Departements d'outre-mer sur 3 chiffres (971 Guadeloupe, 972 Martinique, ...)
+OVERSEAS_PREFIXES = ("971", "972", "973", "974", "975", "976", "977", "978", "984", "986", "987", "988")
+
 
 def get_search_urls() -> list[str]:
     raw = os.environ.get("SEARCH_URLS")
@@ -32,14 +39,25 @@ def get_search_urls() -> list[str]:
     return DEFAULT_SEARCH_URLS
 
 
-def load_seen_ids() -> set[str]:
-    if STATE_FILE.exists():
-        return set(json.loads(STATE_FILE.read_text()))
-    return set()
+def load_json(path: Path, default):
+    if path.exists():
+        return json.loads(path.read_text())
+    return default
 
 
-def save_seen_ids(ids: set[str]) -> None:
-    STATE_FILE.write_text(json.dumps(sorted(ids), indent=2))
+def save_json(path: Path, data) -> None:
+    path.write_text(json.dumps(data, indent=2, ensure_ascii=False, sort_keys=True))
+
+
+def department_from_address(address: str) -> str | None:
+    match = re.search(r"\b(\d{5})\b", address)
+    if not match:
+        return None
+    postal_code = match.group(1)
+    for prefix in OVERSEAS_PREFIXES:
+        if postal_code.startswith(prefix):
+            return prefix[:3]
+    return postal_code[:2]
 
 
 def fetch_listings(search_url: str) -> list[dict]:
@@ -74,6 +92,7 @@ def fetch_listings(search_url: str) -> list[dict]:
                 "id": f"{search_url}#{listing_id}",
                 "title": title,
                 "address": address,
+                "department": department_from_address(address),
                 "price": price,
                 "details": details,
                 "url": f"https://trouverunlogement.lescrous.fr{href}",
@@ -82,7 +101,9 @@ def fetch_listings(search_url: str) -> list[dict]:
     return listings
 
 
-def send_telegram_message(token: str, chat_id: str, text: str) -> None:
+def send_telegram_message(token: str, chat_id: str | int, text: str) -> bool:
+    """Returns True on success. Returns False (without raising) if Telegram rejects the chat_id
+    (e.g. user blocked the bot or never started a private chat with it)."""
     url = f"https://api.telegram.org/bot{token}/sendMessage"
     resp = requests.post(
         url,
@@ -94,13 +115,20 @@ def send_telegram_message(token: str, chat_id: str, text: str) -> None:
         },
         timeout=30,
     )
-    if not resp.ok:
-        log.error("Echec envoi Telegram: %s", resp.text)
+    if resp.ok:
+        return True
+
+    if resp.status_code == 403:
+        log.warning("Bot bloque ou chat inaccessible pour %s: %s", chat_id, resp.text)
+        return False
+
+    log.error("Echec envoi Telegram vers %s: %s", chat_id, resp.text)
     resp.raise_for_status()
+    return False
 
 
 def format_message(listing: dict) -> str:
-    lines = [f"🏠 <b>Nouveau logement CROUS</b>", f"<b>{listing['title']}</b>"]
+    lines = ["🏠 <b>Nouveau logement CROUS</b>", f"<b>{listing['title']}</b>"]
     if listing["address"]:
         lines.append(listing["address"])
     if listing["price"]:
@@ -111,6 +139,101 @@ def format_message(listing: dict) -> str:
     return "\n".join(lines)
 
 
+# --- Gestion des commandes utilisateur (/notifyadd, /notifyremove, /notifylist) ---
+
+COMMAND_RE = re.compile(r"^/(notifyadd|notifyremove|notifylist|start|help)(?:@\w+)?(?:\s+(.*))?$")
+
+
+def fetch_updates(token: str, offset: int) -> list[dict]:
+    url = f"https://api.telegram.org/bot{token}/getUpdates"
+    resp = requests.get(
+        url,
+        params={"offset": offset, "timeout": 0, "allowed_updates": json.dumps(["message"])},
+        timeout=30,
+    )
+    resp.raise_for_status()
+    data = resp.json()
+    if not data.get("ok"):
+        log.error("Echec getUpdates: %s", data)
+        return []
+    return data["result"]
+
+
+def handle_commands(token: str, subscribers: dict[str, list[str]]) -> int:
+    """Processes pending private-chat commands, mutates `subscribers` in place.
+    Returns the next update offset to persist."""
+    offset_data = load_json(OFFSET_FILE, {"offset": 0})
+    updates = fetch_updates(token, offset_data["offset"])
+
+    next_offset = offset_data["offset"]
+    for update in updates:
+        next_offset = update["update_id"] + 1
+
+        message = update.get("message")
+        if not message or message.get("chat", {}).get("type") != "private":
+            continue
+
+        text = message.get("text", "")
+        match = COMMAND_RE.match(text.strip())
+        if not match:
+            continue
+
+        command, arg = match.group(1), (match.group(2) or "").strip()
+        chat_id = str(message["chat"]["id"])
+
+        if command in ("start", "help"):
+            reply = (
+                "👋 Salut ! Je notifie les nouveaux logements CROUS.\n\n"
+                "Commandes :\n"
+                "/notifyadd 59 — recevoir une notif privee pour les nouveaux logements du departement 59\n"
+                "/notifyremove 59 — arreter les notifs pour ce departement\n"
+                "/notifylist — voir tes departements suivis"
+            )
+        elif command == "notifyadd":
+            if not re.fullmatch(r"\d{2,3}", arg):
+                reply = "⚠️ Utilise un numero de departement, ex: /notifyadd 59"
+            else:
+                depts = subscribers.setdefault(chat_id, [])
+                if arg not in depts:
+                    depts.append(arg)
+                reply = f"✅ Tu seras notifie pour les nouveaux logements du departement {arg}."
+        elif command == "notifyremove":
+            depts = subscribers.get(chat_id, [])
+            if arg in depts:
+                depts.remove(arg)
+                if not depts:
+                    subscribers.pop(chat_id, None)
+                reply = f"🛑 Notifications arretees pour le departement {arg}."
+            else:
+                reply = f"Tu n'etais pas abonne au departement {arg}."
+        elif command == "notifylist":
+            depts = subscribers.get(chat_id, [])
+            reply = (
+                f"📋 Departements suivis : {', '.join(depts)}" if depts else "Tu ne suis aucun departement pour l'instant. Utilise /notifyadd 59"
+            )
+        else:
+            continue
+
+        send_telegram_message(token, chat_id, reply)
+
+    save_json(OFFSET_FILE, {"offset": next_offset})
+    return next_offset
+
+
+def notify_subscribers(token: str, subscribers: dict[str, list[str]], new_listings: list[dict]) -> None:
+    blocked_chat_ids = []
+    for chat_id, depts in subscribers.items():
+        matches = [listing for listing in new_listings if listing["department"] in depts]
+        for listing in matches:
+            ok = send_telegram_message(token, chat_id, format_message(listing))
+            if not ok:
+                blocked_chat_ids.append(chat_id)
+                break
+
+    for chat_id in blocked_chat_ids:
+        subscribers.pop(chat_id, None)
+
+
 def main() -> int:
     token = os.environ.get("TELEGRAM_BOT_TOKEN")
     chat_id = os.environ.get("TELEGRAM_CHAT_ID")
@@ -118,7 +241,12 @@ def main() -> int:
         log.error("TELEGRAM_BOT_TOKEN et TELEGRAM_CHAT_ID doivent etre definis")
         return 1
 
-    seen_ids = load_seen_ids()
+    subscribers = load_json(SUBSCRIBERS_FILE, {})
+    handle_commands(token, subscribers)
+    save_json(SUBSCRIBERS_FILE, subscribers)
+
+    seen_ids = load_json(SEEN_IDS_FILE, [])
+    seen_ids = set(seen_ids)
     is_first_run = len(seen_ids) == 0
 
     all_listings: list[dict] = []
@@ -133,7 +261,7 @@ def main() -> int:
 
     if is_first_run:
         log.info("Premiere execution: %d logements references sans notification", len(current_ids))
-        save_seen_ids(current_ids)
+        save_json(SEEN_IDS_FILE, sorted(current_ids))
         send_telegram_message(
             token,
             chat_id,
@@ -148,7 +276,10 @@ def main() -> int:
     for listing in new_listings:
         send_telegram_message(token, chat_id, format_message(listing))
 
-    save_seen_ids(seen_ids | current_ids)
+    notify_subscribers(token, subscribers, new_listings)
+    save_json(SUBSCRIBERS_FILE, subscribers)
+
+    save_json(SEEN_IDS_FILE, sorted(seen_ids | current_ids))
     return 0
 
 
