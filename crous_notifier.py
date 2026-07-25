@@ -6,6 +6,7 @@ import os
 import re
 import sys
 from pathlib import Path
+from urllib.parse import urlencode, urlparse, parse_qsl, urlunparse
 
 import requests
 from bs4 import BeautifulSoup
@@ -60,8 +61,29 @@ def department_from_address(address: str) -> str | None:
     return postal_code[:2]
 
 
+def _with_page(search_url: str, page: int) -> str:
+    parts = urlparse(search_url)
+    query = dict(parse_qsl(parts.query))
+    query["page"] = str(page)
+    return urlunparse(parts._replace(query=urlencode(query)))
+
+
 def fetch_listings(search_url: str) -> list[dict]:
-    resp = requests.get(search_url, headers={"User-Agent": USER_AGENT}, timeout=30)
+    """Fetches every page of results for a search URL (the site paginates at 24 per page)."""
+    all_listings: list[dict] = []
+    page = 1
+    while True:
+        page_url = _with_page(search_url, page)
+        page_listings = fetch_listings_page(page_url, search_url)
+        if not page_listings:
+            break
+        all_listings.extend(page_listings)
+        page += 1
+    return all_listings
+
+
+def fetch_listings_page(page_url: str, search_url: str) -> list[dict]:
+    resp = requests.get(page_url, headers={"User-Agent": USER_AGENT}, timeout=30)
     resp.raise_for_status()
     resp.encoding = "utf-8"
     soup = BeautifulSoup(resp.text, "html.parser")
