@@ -3,7 +3,7 @@
 Bot qui surveille les nouveaux logements publiés sur [trouverunlogement.lescrous.fr](https://trouverunlogement.lescrous.fr/)
 (toute la France, années 2025‑2026 et 2026‑2027) et envoie une notification Telegram à chaque nouvelle annonce.
 
-Aucun serveur à héberger : le bot tourne gratuitement via **GitHub Actions**, toutes les 15 minutes.
+Aucun serveur à héberger : le bot tourne via **un CronTab**, chaque minute.
 
 ## 1. Créer le bot Telegram
 
